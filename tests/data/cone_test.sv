@@ -37,6 +37,12 @@ module test(
         .qux_in (the_intfs[1]),
         .qux_out (the_intfs[2]),
         .clk);
+
+    logic bit_driver;
+    logic [3:0] bit_driven;
+    for (genvar i = 0; i < 4; i++) begin
+        assign bit_driven[i] = bit_driver;
+    end
 endmodule
 
 module sub(

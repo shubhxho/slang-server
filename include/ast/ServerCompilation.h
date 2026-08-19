@@ -13,6 +13,7 @@
 #include "util/Converters.h"
 #include <filesystem>
 #include <memory>
+#include <set>
 #include <vector>
 
 #include "slang/util/Bag.h"
@@ -20,10 +21,11 @@
 namespace server {
 using namespace slang;
 
-/// @brief A single endpoint of a driver/load cone: the hierarchical RTL path of the
-/// driver/load and the source location where it appears.
+/// @brief A single endpoint of a driver/load cone.
 struct ConeEntry {
+    // The hierarchical RTL path of the signal
     std::string path;
+    // The declaration location of the signal
     lsp::Location location;
 };
 
@@ -84,7 +86,7 @@ public:
         auto cone = m_analysis->getCone<isDrivers>(path);
         std::vector<ConeEntry> result;
         for (const auto leaf : cone) {
-            auto range = leaf.getSourceRange();
+            auto range = leaf.getDeclarationRange();
             if (range.start().valid()) {
                 auto fullPath = std::filesystem::absolute(
                     m_sourceManager.getFileName(range.start()));

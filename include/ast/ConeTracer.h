@@ -7,9 +7,9 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "util/ScopedRestore.h"
+#include <functional>
 #include <set>
-#include <string_view>
-#include <variant>
 
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Expression.h"
@@ -25,48 +25,28 @@
 #include "slang/text/SourceLocation.h"
 #include "slang/util/Util.h"
 
+using server::utils::ScopedReset;
+using server::utils::ScopedRestore;
+
 class ConeLeaf {
 public:
-    ConeLeaf(const slang::ast::PortSymbol* port) : variant(port) {}
-    ConeLeaf(const slang::ast::ValueExpressionBase* expr) : variant(expr) {}
+    ConeLeaf(const slang::ast::PortSymbol* port) : symbol(port->internalSymbol) {}
+    ConeLeaf(const slang::ast::ValueExpressionBase* expr) : symbol(concreteSymbol(&expr->symbol)) {}
 
     std::string getHierarchicalPath() const {
-        const slang::ast::Symbol* symbol = nullptr;
-
-        if (const slang::ast::PortSymbol* const* port = std::get_if<const slang::ast::PortSymbol*>(
-                &variant)) {
-            symbol = (*port)->internalSymbol;
-        }
-        else if (const slang::ast::ValueExpressionBase* const* expr =
-                     std::get_if<const slang::ast::ValueExpressionBase*>(&variant)) {
-            symbol = concreteSymbol(&(*expr)->symbol);
-        }
-        else {
-            SLANG_UNREACHABLE;
-        }
-
         SLANG_ASSERT(symbol);
         return symbol->getHierarchicalPath();
     }
 
-    slang::SourceRange getSourceRange() const {
-        if (const slang::ast::PortSymbol* const* port = std::get_if<const slang::ast::PortSymbol*>(
-                &variant)) {
-            auto startLoc = (*port)->internalSymbol->location;
-            slang::SourceLocation endLoc(
-                startLoc.buffer(), startLoc.offset() + (*port)->internalSymbol->name.length());
-            return slang::SourceRange(startLoc, endLoc);
-        }
-        else if (const slang::ast::ValueExpressionBase* const* expr =
-                     std::get_if<const slang::ast::ValueExpressionBase*>(&variant)) {
-            return (*expr)->sourceRange;
-        }
-        else {
-            SLANG_UNREACHABLE;
-        }
+    slang::SourceRange getDeclarationRange() const {
+        SLANG_ASSERT(symbol);
+        auto startLoc = symbol->location;
+        return slang::SourceRange(startLoc, startLoc + symbol->name.length());
     }
 
-    bool operator<(const ConeLeaf& other) const { return variant < other.variant; }
+    bool operator<(const ConeLeaf& other) const {
+        return std::less<const slang::ast::Symbol*>{}(symbol, other.symbol);
+    }
 
     static const slang::ast::Symbol* concreteSymbol(const slang::ast::Symbol* symbol) {
         if (const auto modport = symbol->as_if<slang::ast::ModportPortSymbol>()) {
@@ -76,8 +56,7 @@ public:
     }
 
 private:
-    const std::variant<const slang::ast::PortSymbol*, const slang::ast::ValueExpressionBase*>
-        variant;
+    const slang::ast::Symbol* symbol;
 };
 
 template<typename TDerived>
@@ -87,18 +66,24 @@ protected:
 
     std::set<ConeLeaf> leaves;
 
-public:
+private:
     ConeTracer(const slang::ast::Symbol* root) : root(ConeLeaf::concreteSymbol(root)) {}
 
+public:
     std::set<ConeLeaf> getLeaves() { return leaves; }
+    friend TDerived;
 };
 
 struct DriversTracer : public ConeTracer<DriversTracer> {
 private:
-    std::set<ConeLeaf> drivers;
+    // Signals that control whether the current assignment executes.
+    std::set<ConeLeaf> conditionDrivers;
 
+    // Whether the current expression is an assignment target.
     bool isLhs = false;
+    // Whether visited value expressions should be recorded as drivers of the root.
     bool isDriven = false;
+    // Whether visited value expressions control which assignments execute.
     bool inCondition = false;
 
     const slang::ast::PortSymbol* portSymbol = nullptr;
@@ -112,57 +97,59 @@ public:
             leaves.insert(&symbol);
         }
         if (inCondition) {
-            drivers.insert(&symbol);
+            conditionDrivers.insert(&symbol);
         }
     }
 
     void handle(const slang::ast::AssignmentExpression& expr) {
-        isLhs = true;
-        expr.left().visit(*this);
-        isLhs = false;
+        ScopedReset drivenScope(isDriven);
+        {
+            ScopedReset lhsScope(isLhs, true);
+            expr.left().visit(*this);
+        }
         if (isDriven) {
             expr.right().visit(*this);
             if (portSymbol) {
                 leaves.insert(portSymbol);
             }
-            for (const auto& driver : drivers) {
+            for (const auto& driver : conditionDrivers) {
                 leaves.insert(driver);
             }
         }
-        isDriven = false;
     }
 
     void handle(const slang::ast::ConditionalStatement& stmt) {
-        auto oldDrivers = drivers;
-        inCondition = true;
-        for (const auto condition : stmt.conditions) {
-            condition.expr->visit(*this);
+        ScopedRestore conditionDriversScope(conditionDrivers);
+        {
+            ScopedReset conditionScope(inCondition, true);
+            for (const auto condition : stmt.conditions) {
+                condition.expr->visit(*this);
+            }
         }
-        inCondition = false;
         stmt.ifTrue.visit(*this);
         if (stmt.ifFalse) {
             stmt.ifFalse->visit(*this);
         }
-        std::swap(drivers, oldDrivers);
     }
 
     void handle(const slang::ast::CaseStatement& stmt) {
-        auto oldDrivers = drivers;
-        inCondition = true;
-        stmt.expr.visit(*this);
-        inCondition = false;
+        ScopedRestore conditionDriversScope(conditionDrivers);
+        {
+            ScopedReset conditionScope(inCondition, true);
+            stmt.expr.visit(*this);
+        }
         for (const auto item : stmt.items) {
-            inCondition = true;
-            for (const auto expr : item.expressions) {
-                expr->visit(*this);
+            {
+                ScopedReset conditionScope(inCondition, true);
+                for (const auto expr : item.expressions) {
+                    expr->visit(*this);
+                }
             }
-            inCondition = false;
             item.stmt->visit(*this);
         }
         if (stmt.defaultCase) {
             stmt.defaultCase->visit(*this);
         }
-        std::swap(drivers, oldDrivers);
     }
 
     void handle(const slang::ast::InstanceSymbol& symbol) {
@@ -176,14 +163,12 @@ public:
             if (port) {
                 if (port->direction == slang::ast::ArgumentDirection::In &&
                     port->internalSymbol == root) {
-                    isDriven = true;
+                    ScopedReset drivenScope(isDriven, true);
                     expr->visit(*this);
-                    isDriven = false;
                 }
                 else if (port->direction == slang::ast::ArgumentDirection::Out) {
-                    portSymbol = port;
+                    ScopedReset portScope(portSymbol, port);
                     expr->visit(*this);
-                    portSymbol = nullptr;
                 }
             }
         }
@@ -194,7 +179,9 @@ public:
 
 struct LoadsTracer : public ConeTracer<LoadsTracer> {
 private:
+    // Whether visited value expressions should be recorded as loads of the root.
     bool isLhs = false;
+    // Whether the root was encountered on the current data or control path.
     bool foundRoot = false;
 
 public:
@@ -208,20 +195,18 @@ public:
     }
 
     void handle(const slang::ast::AssignmentExpression& expr) {
-        bool oldFoundRoot = foundRoot;
+        ScopedRestore foundRootScope(foundRoot);
         if (!foundRoot) {
             expr.right().visit(*this);
         }
         if (foundRoot) {
-            isLhs = true;
+            ScopedReset lhsScope(isLhs, true);
             expr.left().visit(*this);
-            isLhs = false;
         }
-        foundRoot = oldFoundRoot;
     }
 
     void handle(const slang::ast::ConditionalStatement& stmt) {
-        bool oldFoundRoot = foundRoot;
+        ScopedRestore foundRootScope(foundRoot);
         for (const auto condition : stmt.conditions) {
             condition.expr->visit(*this);
         }
@@ -229,7 +214,23 @@ public:
         if (stmt.ifFalse) {
             stmt.ifFalse->visit(*this);
         }
-        foundRoot = oldFoundRoot;
+    }
+
+    void handle(const slang::ast::CaseStatement& stmt) {
+        ScopedRestore foundRootScope(foundRoot);
+        stmt.expr.visit(*this);
+        bool selectorFoundRoot = foundRoot;
+        for (const auto item : stmt.items) {
+            foundRoot = selectorFoundRoot;
+            for (const auto expr : item.expressions) {
+                expr->visit(*this);
+            }
+            item.stmt->visit(*this);
+        }
+        if (stmt.defaultCase) {
+            foundRoot = selectorFoundRoot;
+            stmt.defaultCase->visit(*this);
+        }
     }
 
     void handle(const slang::ast::InstanceSymbol& symbol) {
@@ -239,16 +240,15 @@ public:
             if (port) {
                 if (port->direction == slang::ast::ArgumentDirection::Out &&
                     port->internalSymbol == root) {
-                    auto oldFoundRoot = std::exchange(foundRoot, true);
+                    ScopedReset foundRootScope(foundRoot, true);
                     connection->getExpression()->visit(*this);
-                    foundRoot = oldFoundRoot;
                 }
                 else if (port->direction == slang::ast::ArgumentDirection::In) {
+                    ScopedReset foundRootScope(foundRoot);
                     connection->getExpression()->visit(*this);
                     if (foundRoot) {
                         leaves.insert(port);
                     }
-                    foundRoot = false;
                 }
             }
         }
